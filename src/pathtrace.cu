@@ -6,7 +6,8 @@
 #include <thrust/device_vector.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
-
+#include <thrust/sort.h>
+#include <thrust/partition.h>
 #include "sceneStructs.h"
 #include "scene.h"
 #include "glm/glm.hpp"
@@ -17,6 +18,7 @@
 
 #define ERRORCHECK 1
 #define STREAMCOMPACT 1
+#define MATERIALSORT 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -315,21 +317,21 @@ __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iteration
     }
 }
 
-// Predicate to check if remainingBounces is zero
-__global__ void computeMaskBufferPartialImage(PathSegment* paths, int num_paths, bool* maskBuffer, glm::vec3* image) {
-    int index = (blockIdx.x * blockDim.x) + threadIdx.x;
-    if (index >= num_paths) return;
-
-    PathSegment path = paths[index];
-
-    if (path.remainingBounces <= 0) {
-        maskBuffer[index] = true;
-        image[path.pixelIndex] += path.color;
+struct materialSortedIntersections
+{
+    __host__ __device__
+        bool operator()(const ShadeableIntersection& a, const ShadeableIntersection& b)
+    {
+        return b.materialId > a.materialId;
     }
-    else {
-        maskBuffer[index] = false;
+};
+
+struct remainBounces {
+    __host__ __device__ bool operator()(const PathSegment& path)
+    {
+        return path.remainingBounces > 0;
     }
-}
+};
 
 /**
  * Wrapper for the __global__ call that sets up the kernel calls and does a ton
@@ -388,15 +390,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     PathSegment* dev_path_end = dev_paths + pixelcount;
     int num_paths = dev_path_end - dev_paths;
 
-    thrust::device_ptr<bool> thrust_maskBuffer(dev_maskBuffer);
-    thrust::device_ptr<PathSegment> thrust_dev_paths(dev_paths);
-    thrust::device_ptr<PathSegment> thrust_dev_paths_end(dev_path_end);
-
     // --- PathSegment Tracing Stage ---
     // Shoot ray into scene, bounce between objects, push shading chunks
 
     bool iterationComplete = false;
-    dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
 
     while (!iterationComplete)
     {
@@ -404,9 +401,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         cudaMemset(dev_intersections, 0, num_paths * sizeof(ShadeableIntersection));
 
         // tracing
-        //numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
+        dim3 numBlocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
 
-        computeIntersections << <numblocksPathSegmentTracing, blockSize1d >> > (
+        computeIntersections << <numBlocksPathSegmentTracing, blockSize1d >> > (
             depth,
             num_paths,
             dev_paths,
@@ -416,7 +413,19 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             );
         checkCUDAError("trace one bounce");
         cudaDeviceSynchronize();
-        depth++;
+
+        // Before shading, sort by material to increase memory coherency and reduce warp divergence.
+#       if MATERIALSORT
+
+        thrust::sort_by_key(
+            thrust::device,
+            dev_intersections,
+            dev_intersections + num_paths,
+            dev_paths,
+            materialSortedIntersections()
+        );
+#       endif
+
 
         // TODO:
         // --- Shading Stage ---
@@ -427,7 +436,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // TODO: compare between directly shading the path segments and shading
         // path segments that have been reshuffled to be contiguous in memory.
 
-        shadeMaterial << <numblocksPathSegmentTracing, blockSize1d >> > (
+        // sort pathSegments and intersections by materialId
+
+
+        shadeMaterial << <numBlocksPathSegmentTracing, blockSize1d >> > (
             iter,
             num_paths,
             dev_intersections,
@@ -439,43 +451,35 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         cudaDeviceSynchronize();
 
 #        if STREAMCOMPACT
-        computeMaskBufferPartialImage << < numblocksPathSegmentTracing, blockSize1d >> > (dev_paths, num_paths, dev_maskBuffer, dev_image);
-        thrust_dev_paths_end = thrust::remove_if(
-            thrust_dev_paths, thrust_dev_paths + num_paths, thrust_maskBuffer, thrust::identity<bool>());
+
+        PathSegment* new_path_end = thrust::partition(thrust::device, dev_paths, dev_paths + num_paths, remainBounces());
         cudaDeviceSynchronize();
 
-        num_paths = thrust_dev_paths_end - thrust_dev_paths;
-        numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
-
-        if (num_paths == 0) iterationComplete = true;
-#       endif
-
-        if (depth == traceDepth)
-            iterationComplete = true;
-        // TODO: should be based off stream compaction results.
+        num_paths = new_path_end - dev_paths;
 
         if (guiData != NULL)
         {
             guiData->TracedDepth = depth;
         }
+
+        if (num_paths == 0) iterationComplete = true;
+#       endif
+
+        depth++;
+
+        if (depth == traceDepth)
+            iterationComplete = true;
+        // TODO: should be based off stream compaction results.
     }
-#   if STREAMCOMPACT
-    if (num_paths)
-    {
-        // Assemble the rest of this iteration and apply it to the image
-        dim3 numBlocksPaths = (num_paths + blockSize1d - 1) / blockSize1d;
-        finalGather << <numBlocksPaths, blockSize1d >> > (num_paths, dev_image, dev_paths);
-        checkCUDAError("finalGather");
-    }
-#   else
-    // Assemble this iteration and apply it to the image
-    finalGather << <numblocksPathSegmentTracing, blockSize1d >> > (pixelcount, dev_image, dev_paths);
-    checkCUDAError("finalGather");
-#   endif
 
     // Assemble this iteration and apply it to the image
-    //dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    //finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    // finalGather << <numBlocksPathSegmentTracing, blockSize1d >> > (pixelcount, dev_image, dev_paths);
+    // checkCUDAError("finalGather");
+
+    num_paths = dev_path_end - dev_paths;
+    // Assemble this iteration and apply it to the image
+    dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
+    finalGather << <numBlocksPixels, blockSize1d >> > (num_paths, dev_image, dev_paths);
 
     ///////////////////////////////////////////////////////////////////////////
 
